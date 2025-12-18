@@ -1,0 +1,38 @@
+name: "Analyze PR Size"
+description: "Summarize PR size (files, additions/deletions) and post an idempotent PR comment"
+inputs:
+  github_token:
+    required: true
+  max_files:
+    required: false
+    default: "500"
+
+  xs_lines:
+    required: false
+    default: "50"
+  s_lines:
+    required: false
+    default: "200"
+  m_lines:
+    required: false
+    default: "500"
+  l_lines:
+    required: false
+    default: "1000"
+
+  xs_files:
+    required: false
+    default: "2"
+  s_files:
+    required: false
+    default: "5"
+  m_files:
+    required: false
+    default: "15"
+  l_files:
+    required: false
+    default: "30"
+
+runs:
+  using: "node20"
+  main: "dist/index.js"

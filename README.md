@@ -1,0 +1,98 @@
+# Analyze PR Size
+
+PR Size Analyzer is a GitHub Action that summarizes pull request size and posts (or updates) a single PR comment.
+
+It answers one question:
+
+How big is this PR, really?
+
+The action is advisory. It does not block merges.
+
+---
+
+## What It Does
+
+On pull request events, it:
+- counts changed files
+- totals additions and deletions
+- computes total lines changed
+- classifies the PR size (XS / S / M / L / XL)
+- posts or updates a single PR comment with the summary
+
+---
+
+## Example Output
+
+PR Size Summary
+
+Files changed: 27  
+Lines added: +812  
+Lines removed: -144  
+Total changed: 956
+
+Size: XL
+
+---
+
+## Usage
+
+```yaml
+name: Analyze PR Size
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Analyze PR size
+        uses: lukekania/analyze-pr-size@v0.1.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+---
+
+## Configuration
+
+| Input | Default | Description |
+|------|---------|-------------|
+| max_files | 500 | Max PR files to inspect |
+| xs_lines | 50 | XS upper bound (lines changed) |
+| s_lines | 200 | S upper bound |
+| m_lines | 500 | M upper bound |
+| l_lines | 1000 | L upper bound |
+| xs_files | 2 | XS upper bound (files changed) |
+| s_files | 5 | S upper bound |
+| m_files | 15 | M upper bound |
+| l_files | 30 | L upper bound |
+
+Classification uses the larger of:
+- file bucket, and
+- line-change bucket
+
+This prevents “many files, few lines” PRs from being mislabeled as small.
+
+---
+
+## Possible Future Features
+
+- Detect “generated files” and downweight them
+- Split recommendations (suggest splitting when XL)
+- Highlight top changed directories/modules
+- Tag PR with a label (optional)
+- Post as a GitHub Actions Step Summary instead of a PR comment
+- Track review time by size bucket (analytics)
+
+---
+
+## License
+
+MIT
