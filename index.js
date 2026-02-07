@@ -128,6 +128,7 @@ async function run() {
 
     const maxFiles = clampInt(core.getInput("max_files"), 500, 1, 5000);
     const addLabel = toBool(core.getInput("add_label"), false);
+    const stepSummary = toBool(core.getInput("step_summary"), false);
 
     const xsLines = clampInt(core.getInput("xs_lines"), 50, 1, 1000000);
     const sLines = clampInt(core.getInput("s_lines"), 200, xsLines, 1000000);
@@ -201,6 +202,11 @@ async function run() {
 
     core.info(res.updated ? "Updated PR size comment." : "Created PR size comment.");
     core.info(`Comment: ${res.url}`);
+
+    if (stepSummary) {
+      await core.summary.addRaw(body).write();
+      core.info("Wrote step summary.");
+    }
 
     if (addLabel) {
       await applySizeLabel(octokit, { owner, repo, prNumber, size });

@@ -74,6 +74,7 @@ jobs:
 | m_files | 15 | M upper bound |
 | l_files | 30 | L upper bound |
 | add_label | false | Add a `size:XS` … `size:XL` label to the PR |
+| step_summary | false | Write the size summary to the GitHub Actions Step Summary |
 
 Classification uses the larger of:
 - file bucket, and
@@ -88,7 +89,6 @@ This prevents “many files, few lines” PRs from being mislabeled as small.
 - Detect “generated files” and downweight them
 - Split recommendations (suggest splitting when XL)
 - Highlight top changed directories/modules
-- Post as a GitHub Actions Step Summary instead of a PR comment
 - Track review time by size bucket (analytics)
 
 ---

@@ -10,6 +10,10 @@ inputs:
     description: "Add a size label (size:XS … size:XL) to the PR"
     required: false
     default: "false"
+  step_summary:
+    description: "Write the size summary to the GitHub Actions Step Summary"
+    required: false
+    default: "false"
 
   xs_lines:
     required: false
