@@ -305,6 +305,16 @@ async function run() {
       await applySizeLabel(octokit, { owner, repo, prNumber, size });
       core.info(`Applied label: ${SIZE_LABEL_PREFIX}${size}`);
     }
+
+    core.setOutput("size", size);
+    core.setOutput("total_lines", totalChanged);
+    core.setOutput("file_count", fileCount);
+
+    const prCreatedAt = ctx.payload.pull_request.created_at;
+    if (prCreatedAt) {
+      const ageHours = Math.round((Date.now() - new Date(prCreatedAt).getTime()) / 3600000);
+      core.setOutput("pr_age_hours", ageHours);
+    }
   } catch (err) {
     core.setFailed(err?.message || String(err));
   }

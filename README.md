@@ -85,9 +85,16 @@ This prevents “many files, few lines” PRs from being mislabeled as small.
 
 ---
 
-## Possible Future Features
+## Outputs
 
-- Track review time by size bucket (analytics)
+| Output | Description |
+|--------|-------------|
+| `size` | Computed size bucket (`XS`, `S`, `M`, `L`, `XL`) |
+| `total_lines` | Total lines changed (additions + deletions) |
+| `file_count` | Number of files changed |
+| `pr_age_hours` | PR age in hours since creation |
+
+Use these outputs to build analytics dashboards or drive downstream workflow decisions (e.g., require extra approvals for XL PRs).
 
 ---
 

@@ -45,6 +45,15 @@ inputs:
     required: false
     default: "30"
 
+outputs:
+  size:
+    description: "Computed size bucket (XS, S, M, L, XL)"
+  total_lines:
+    description: "Total lines changed (additions + deletions)"
+  file_count:
+    description: "Number of files changed"
+  pr_age_hours:
+    description: "PR age in hours since creation"
 runs:
   using: "node20"
   main: "dist/index.js"
