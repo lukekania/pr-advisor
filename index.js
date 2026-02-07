@@ -177,6 +177,29 @@ function formatDirectoryTable(dirs) {
   return table;
 }
 
+function buildSplitRecommendation(files, size) {
+  if (size !== "L" && size !== "XL") return "";
+
+  const topDirMap = new Map();
+  for (const f of files) {
+    const dir = f.filename.split("/").slice(0, 2).join("/") || ".";
+    const prev = topDirMap.get(dir) || 0;
+    topDirMap.set(dir, prev + (f.additions || 0) + (f.deletions || 0));
+  }
+
+  const sorted = [...topDirMap.entries()].sort((a, b) => b[1] - a[1]);
+  if (sorted.length < 2) return "";
+
+  const parts = [];
+  parts.push("\n**Split recommendation:** This PR is large — consider splitting it:");
+  const top3 = sorted.slice(0, 3);
+  for (const [dir, lines] of top3) {
+    parts.push(`- \`${dir}\` (${fmt(lines)} lines)`);
+  }
+  parts.push("");
+  return parts.join("\n");
+}
+
 function fmt(n) {
   return new Intl.NumberFormat("en-US").format(n);
 }
@@ -249,6 +272,7 @@ async function run() {
 
     const topDirs = topChangedDirectories(files, 2, 5);
     const dirSection = formatDirectoryTable(topDirs);
+    const splitSection = buildSplitRecommendation(files, size);
 
     const body =
       `### PR Size Summary\n${MARKER}\n\n` +
@@ -258,7 +282,8 @@ async function run() {
       `Total changed: **${fmt(totalChanged)}**\n\n` +
       `Size: **${size}**\n` +
       (ignoredCount > 0 ? `_(${ignoredCount} generated/lock file${ignoredCount === 1 ? "" : "s"} excluded)_\n` : "") +
-      dirSection + `\n` +
+      dirSection +
+      splitSection + `\n` +
       `_Notes: size is based on the larger of file-count bucket and line-change bucket._\n`;
 
     const res = await upsertComment(octokit, {

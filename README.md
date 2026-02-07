@@ -87,7 +87,6 @@ This prevents “many files, few lines” PRs from being mislabeled as small.
 
 ## Possible Future Features
 
-- Split recommendations (suggest splitting when XL)
 - Track review time by size bucket (analytics)
 
 ---
