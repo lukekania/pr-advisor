@@ -1,319 +1,210 @@
 const core = require("@actions/core");
 const github = require("@actions/github");
-const { minimatch } = require("minimatch");
 
-const MARKER = "<!-- analyze-pr-size:v0 -->";
+const { toBool, clampInt, upsertComment, deleteCommentByMarker, listAllPRFiles, fmt } = require("./lib/utils");
+const { DEFAULT_IGNORE, parseIgnorePatterns, filterIgnoredFiles, analyzeSize, formatSizeSection, applySizeLabel } = require("./lib/size-analyzer");
+const { daysBetween, analyzeState, formatStateSection, staleSweep } = require("./lib/state-explainer");
+const { parseCommaSeparated, analyzeReviewers, formatReviewerSection } = require("./lib/reviewer-suggester");
 
-function toBool(s, def) {
-  if (s === undefined || s === null || s === "") return def;
-  return /^(true|yes|1|on)$/i.test(String(s).trim());
-}
+const MARKER = "<!-- pr-advisor:v0 -->";
 
-function clampInt(val, def, min, max) {
-  const n = parseInt(String(val ?? def), 10);
-  if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, n));
-}
+const OLD_MARKERS = [
+  "<!-- analyze-pr-size:v0 -->",
+  "<!-- pr-state-explainer:v0 -->",
+  "<!-- reviewer-suggester:v0 -->"
+];
 
-function bucketByThresholds(value, thresholds) {
-  // thresholds = [{name:"XS", max:...}, ...], last implied "XL"
-  for (const t of thresholds) {
-    if (value <= t.max) return t.name;
-  }
-  return "XL";
-}
-
-const SIZE_ORDER = ["XS", "S", "M", "L", "XL"];
-function maxBucket(a, b) {
-  return SIZE_ORDER[Math.max(SIZE_ORDER.indexOf(a), SIZE_ORDER.indexOf(b))];
-}
-
-async function upsertComment(octokit, { owner, repo, issue_number, body }) {
-  const comments = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number,
-    per_page: 100
-  });
-
-  const existing = comments.data.find((c) => (c.body || "").includes(MARKER));
-  if (existing) {
-    await octokit.rest.issues.updateComment({
-      owner,
-      repo,
-      comment_id: existing.id,
-      body
-    });
-    return { updated: true, url: existing.html_url };
-  }
-
-  const created = await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number,
-    body
-  });
-  return { updated: false, url: created.data.html_url };
-}
-
-async function listAllPRFiles(octokit, { owner, repo, pull_number, maxFiles }) {
-  const files = [];
-  let page = 1;
-
-  while (files.length < maxFiles) {
-    const resp = await octokit.rest.pulls.listFiles({
-      owner,
-      repo,
-      pull_number,
-      per_page: 100,
-      page
-    });
-
-    if (resp.data.length === 0) break;
-
-    for (const f of resp.data) {
-      files.push(f);
-      if (files.length >= maxFiles) break;
-    }
-
-    if (resp.data.length < 100) break;
-    page += 1;
-  }
-
-  return files;
-}
-
-const SIZE_LABEL_PREFIX = "size:";
-
-async function applySizeLabel(octokit, { owner, repo, prNumber, size }) {
-  const targetLabel = SIZE_LABEL_PREFIX + size;
-
-  const { data: currentLabels } = await octokit.rest.issues.listLabelsOnIssue({
-    owner,
-    repo,
-    issue_number: prNumber,
-    per_page: 100
-  });
-
-  const staleLabels = currentLabels.filter(
-    (l) => l.name.startsWith(SIZE_LABEL_PREFIX) && l.name !== targetLabel
-  );
-
-  for (const label of staleLabels) {
-    await octokit.rest.issues.removeLabel({
-      owner,
-      repo,
-      issue_number: prNumber,
-      name: label.name
-    });
-  }
-
-  const alreadyApplied = currentLabels.some((l) => l.name === targetLabel);
-  if (!alreadyApplied) {
-    await octokit.rest.issues.addLabels({
-      owner,
-      repo,
-      issue_number: prNumber,
-      labels: [targetLabel]
-    });
-  }
-}
-
-const DEFAULT_IGNORE = "dist/**,*.min.js,*.min.css,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*";
-
-function parseIgnorePatterns(raw) {
-  return raw
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean);
-}
-
-function filterIgnoredFiles(files, patterns) {
-  if (patterns.length === 0) return { counted: files, ignoredCount: 0 };
-
-  const counted = [];
-  let ignoredCount = 0;
-
-  for (const f of files) {
-    const ignored = patterns.some((p) => minimatch(f.filename, p, { matchBase: true }));
-    if (ignored) {
-      ignoredCount++;
-    } else {
-      counted.push(f);
+async function cleanupOldComments(octokit, { owner, repo, issue_number }) {
+  for (const marker of OLD_MARKERS) {
+    try {
+      await deleteCommentByMarker(octokit, { owner, repo, issue_number, marker });
+    } catch {
+      // best effort
     }
   }
-
-  return { counted, ignoredCount };
-}
-
-function topChangedDirectories(files, maxDepth, limit) {
-  const dirMap = new Map();
-
-  for (const f of files) {
-    const segments = f.filename.split("/");
-    const dir = segments.length <= maxDepth
-      ? segments.slice(0, -1).join("/") || "."
-      : segments.slice(0, maxDepth).join("/");
-    const prev = dirMap.get(dir) || { files: 0, lines: 0 };
-    prev.files += 1;
-    prev.lines += (f.additions || 0) + (f.deletions || 0);
-    dirMap.set(dir, prev);
-  }
-
-  return [...dirMap.entries()]
-    .sort((a, b) => b[1].lines - a[1].lines)
-    .slice(0, limit)
-    .map(([dir, stats]) => ({ dir, ...stats }));
-}
-
-function formatDirectoryTable(dirs) {
-  if (dirs.length === 0) return "";
-  let table = "\n**Top changed directories:**\n\n";
-  table += "| Directory | Files | Lines |\n";
-  table += "|-----------|------:|------:|\n";
-  for (const d of dirs) {
-    table += `| \`${d.dir}\` | ${d.files} | ${fmt(d.lines)} |\n`;
-  }
-  return table;
-}
-
-function buildSplitRecommendation(files, size) {
-  if (size !== "L" && size !== "XL") return "";
-
-  const topDirMap = new Map();
-  for (const f of files) {
-    const dir = f.filename.split("/").slice(0, 2).join("/") || ".";
-    const prev = topDirMap.get(dir) || 0;
-    topDirMap.set(dir, prev + (f.additions || 0) + (f.deletions || 0));
-  }
-
-  const sorted = [...topDirMap.entries()].sort((a, b) => b[1] - a[1]);
-  if (sorted.length < 2) return "";
-
-  const parts = [];
-  parts.push("\n**Split recommendation:** This PR is large — consider splitting it:");
-  const top3 = sorted.slice(0, 3);
-  for (const [dir, lines] of top3) {
-    parts.push(`- \`${dir}\` (${fmt(lines)} lines)`);
-  }
-  parts.push("");
-  return parts.join("\n");
-}
-
-function fmt(n) {
-  return new Intl.NumberFormat("en-US").format(n);
 }
 
 async function run() {
   try {
     const token = core.getInput("github_token", { required: true });
+    const dryRun = toBool(core.getInput("dry_run"), false);
+    const stepSummary = toBool(core.getInput("step_summary"), false);
 
+    // Section toggles
+    const enableSize = toBool(core.getInput("enable_size"), true);
+    const enableState = toBool(core.getInput("enable_state"), true);
+    const enableReviewer = toBool(core.getInput("enable_reviewer"), true);
+
+    // Size inputs
     const maxFiles = clampInt(core.getInput("max_files"), 500, 1, 5000);
     const addLabel = toBool(core.getInput("add_label"), false);
-    const stepSummary = toBool(core.getInput("step_summary"), false);
     const ignoreRaw = core.getInput("ignore_patterns") || DEFAULT_IGNORE;
     const ignorePatterns = parseIgnorePatterns(ignoreRaw);
-
     const xsLines = clampInt(core.getInput("xs_lines"), 50, 1, 1000000);
     const sLines = clampInt(core.getInput("s_lines"), 200, xsLines, 1000000);
     const mLines = clampInt(core.getInput("m_lines"), 500, sLines, 1000000);
     const lLines = clampInt(core.getInput("l_lines"), 1000, mLines, 1000000);
-
     const xsFiles = clampInt(core.getInput("xs_files"), 2, 1, 1000000);
     const sFiles = clampInt(core.getInput("s_files"), 5, xsFiles, 1000000);
     const mFiles = clampInt(core.getInput("m_files"), 15, sFiles, 1000000);
     const lFiles = clampInt(core.getInput("l_files"), 30, mFiles, 1000000);
 
+    // State inputs
+    const staleDays = clampInt(core.getInput("stale_days"), 3, 1, 365);
+    const commentOnlyWhenStale = toBool(core.getInput("comment_only_when_stale"), false);
+    const maxChecks = clampInt(core.getInput("max_checks"), 50, 10, 200);
+    const staleOverridesRaw = core.getInput("stale_overrides") || "";
+    const showReviewLatency = toBool(core.getInput("review_latency"), false);
+    const language = (core.getInput("language") || "en").trim().toLowerCase();
+    const sweepStale = toBool(core.getInput("sweep_stale"), false);
+    const maxPRs = clampInt(core.getInput("max_prs"), 50, 1, 200);
+
+    // Reviewer inputs
+    const maxReviewers = clampInt(core.getInput("max_reviewers"), 3, 1, 20);
+    const lookbackDays = clampInt(core.getInput("lookback_days"), 90, 1, 365);
+    const reviewerMaxFiles = clampInt(core.getInput("reviewer_max_files"), 50, 1, 200);
+    const useCodeowners = toBool(core.getInput("use_codeowners"), true);
+    const useLatency = toBool(core.getInput("use_latency"), true);
+    const latencyPRs = clampInt(core.getInput("latency_prs"), 20, 5, 50);
+    const penalizeLoad = toBool(core.getInput("penalize_load"), true);
+    const excludeReviewersInput = parseCommaSeparated(core.getInput("exclude_reviewers"));
+    const crossRepoList = parseCommaSeparated(core.getInput("cross_repo_list"));
+    const requiredReviewers = parseCommaSeparated(core.getInput("required_reviewers"));
+    const preferTimezone = (core.getInput("prefer_timezone") || "").trim();
+    const showBreakdown = toBool(core.getInput("show_breakdown"), false);
+    const detectFlaky = toBool(core.getInput("detect_flaky"), false);
+
     const ctx = github.context;
+    const octokit = github.getOctokit(token);
+    const { owner, repo } = ctx.repo;
+
+    // Stale sweep mode: only state section runs, iterates all open PRs
+    if (sweepStale || ctx.eventName === "schedule") {
+      await staleSweep(octokit, {
+        owner, repo, staleDays, maxChecks, staleOverridesRaw,
+        dryRun, showReviewLatency, language, maxPRs, marker: MARKER
+      });
+      return;
+    }
+
     if (ctx.eventName !== "pull_request" || !ctx.payload.pull_request) {
       core.info("Not a pull_request event; skipping.");
       return;
     }
 
-    const octokit = github.getOctokit(token);
-    const { owner, repo } = ctx.repo;
     const prNumber = ctx.payload.pull_request.number;
+    const prAuthor = ctx.payload.pull_request.user?.login;
+    const prHeadSha = ctx.payload.pull_request.head?.sha;
 
-    const allFiles = await listAllPRFiles(octokit, {
-      owner,
-      repo,
-      pull_number: prNumber,
-      maxFiles
-    });
-
-    const { counted: files, ignoredCount } = filterIgnoredFiles(allFiles, ignorePatterns);
-
-    let additions = 0;
-    let deletions = 0;
-
-    for (const f of files) {
-      additions += f.additions || 0;
-      deletions += f.deletions || 0;
+    // Check stale-only mode
+    if (commentOnlyWhenStale) {
+      const updatedAt = new Date(ctx.payload.pull_request.updated_at);
+      const ageDays = daysBetween(new Date(), updatedAt);
+      if (ageDays < staleDays) {
+        core.info(`PR not stale (${ageDays.toFixed(2)} days < ${staleDays}); skipping comment.`);
+        return;
+      }
     }
 
-    const fileCount = files.length;
-    const totalChanged = additions + deletions;
+    // ---- Shared API calls (fetch once, pass to modules) ----
+    const prResp = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    const pr = prResp.data;
 
-    const lineBucket = bucketByThresholds(totalChanged, [
-      { name: "XS", max: xsLines },
-      { name: "S", max: sLines },
-      { name: "M", max: mLines },
-      { name: "L", max: lLines }
-    ]);
-
-    const fileBucket = bucketByThresholds(fileCount, [
-      { name: "XS", max: xsFiles },
-      { name: "S", max: sFiles },
-      { name: "M", max: mFiles },
-      { name: "L", max: lFiles }
-    ]);
-
-    const size = maxBucket(lineBucket, fileBucket);
-
-    const topDirs = topChangedDirectories(files, 2, 5);
-    const dirSection = formatDirectoryTable(topDirs);
-    const splitSection = buildSplitRecommendation(files, size);
-
-    const body =
-      `### PR Size Summary\n${MARKER}\n\n` +
-      `Files changed: **${fmt(fileCount)}**\n\n` +
-      `Lines added: **+${fmt(additions)}**  \n` +
-      `Lines removed: **-${fmt(deletions)}**  \n` +
-      `Total changed: **${fmt(totalChanged)}**\n\n` +
-      `Size: **${size}**\n` +
-      (ignoredCount > 0 ? `_(${ignoredCount} generated/lock file${ignoredCount === 1 ? "" : "s"} excluded)_\n` : "") +
-      dirSection +
-      splitSection + `\n` +
-      `_Notes: size is based on the larger of file-count bucket and line-change bucket._\n`;
-
-    const res = await upsertComment(octokit, {
-      owner,
-      repo,
-      issue_number: prNumber,
-      body
+    const allFiles = await listAllPRFiles(octokit, {
+      owner, repo, pull_number: prNumber, maxFiles
     });
 
-    core.info(res.updated ? "Updated PR size comment." : "Created PR size comment.");
+    const reviewsResp = await octokit.rest.pulls.listReviews({
+      owner, repo, pull_number: prNumber, per_page: 100
+    });
+
+    const checksResp = await octokit.rest.checks.listForRef({
+      owner, repo, ref: pr.head.sha, per_page: maxChecks
+    });
+
+    // ---- Build sections ----
+    const sections = [];
+
+    if (enableSize) {
+      const { counted: files, ignoredCount } = filterIgnoredFiles(allFiles, ignorePatterns);
+      const thresholds = { xsLines, sLines, mLines, lLines, xsFiles, sFiles, mFiles, lFiles };
+      const sizeResult = analyzeSize({ files, thresholds });
+
+      sections.push(formatSizeSection({
+        ...sizeResult,
+        ignoredCount,
+        files
+      }));
+
+      core.setOutput("size", sizeResult.size);
+      core.setOutput("total_lines", sizeResult.totalChanged);
+      core.setOutput("file_count", sizeResult.fileCount);
+
+      const prCreatedAt = ctx.payload.pull_request.created_at;
+      if (prCreatedAt) {
+        const ageHours = Math.round((Date.now() - new Date(prCreatedAt).getTime()) / 3600000);
+        core.setOutput("pr_age_hours", ageHours);
+      }
+
+      if (addLabel) {
+        await applySizeLabel(octokit, { owner, repo, prNumber, size: sizeResult.size });
+        core.info(`Applied label: size:${sizeResult.size}`);
+      }
+    }
+
+    if (enableState) {
+      const analysis = await analyzeState(octokit, {
+        owner, repo, pr,
+        reviews: reviewsResp.data,
+        checkRuns: checksResp.data.check_runs || [],
+        staleDays, staleOverridesRaw, showReviewLatency, language
+      });
+
+      sections.push(formatStateSection(analysis));
+    }
+
+    if (enableReviewer) {
+      const reviewerResult = await analyzeReviewers(octokit, {
+        owner, repo, prNumber, prAuthor, prHeadSha,
+        files: allFiles, reviews: reviewsResp.data,
+        config: {
+          maxReviewers, lookbackDays, maxFiles: reviewerMaxFiles,
+          useCodeowners, useLatency, latencyPRs,
+          penalizeLoad, excludeReviewersInput, crossRepoList, requiredReviewers,
+          preferTimezone, showBreakdown, detectFlaky
+        }
+      });
+
+      sections.push(formatReviewerSection(reviewerResult));
+
+      if (dryRun) {
+        core.setOutput("suggestions_json", JSON.stringify(reviewerResult.suggestions));
+      }
+    }
+
+    if (sections.length === 0) {
+      core.info("All sections disabled; nothing to do.");
+      return;
+    }
+
+    const body = `### PR Advisor\n${MARKER}\n\n---\n` + sections.join("\n---\n");
+
+    if (dryRun) {
+      core.info("Dry-run mode: comment body below (not posted):");
+      core.info(body);
+      return;
+    }
+
+    // Clean up old individual action comments on first run
+    await cleanupOldComments(octokit, { owner, repo, issue_number: prNumber });
+
+    const res = await upsertComment(octokit, { owner, repo, issue_number: prNumber, body, marker: MARKER });
+    core.info(res.updated ? "Updated PR Advisor comment." : "Created PR Advisor comment.");
     core.info(`Comment: ${res.url}`);
 
     if (stepSummary) {
       await core.summary.addRaw(body).write();
       core.info("Wrote step summary.");
-    }
-
-    if (addLabel) {
-      await applySizeLabel(octokit, { owner, repo, prNumber, size });
-      core.info(`Applied label: ${SIZE_LABEL_PREFIX}${size}`);
-    }
-
-    core.setOutput("size", size);
-    core.setOutput("total_lines", totalChanged);
-    core.setOutput("file_count", fileCount);
-
-    const prCreatedAt = ctx.payload.pull_request.created_at;
-    if (prCreatedAt) {
-      const ageHours = Math.round((Date.now() - new Date(prCreatedAt).getTime()) / 3600000);
-      core.setOutput("pr_age_hours", ageHours);
     }
   } catch (err) {
     core.setFailed(err?.message || String(err));

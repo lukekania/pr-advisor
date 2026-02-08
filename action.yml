@@ -1,24 +1,44 @@
-name: "Analyze PR Size"
-description: "Summarize PR size (files, additions/deletions) and post an idempotent PR comment"
+name: "PR Advisor"
+description: "Unified PR analysis: size classification, state explanation, and reviewer suggestions in a single comment"
 inputs:
   github_token:
     required: true
+
+  # Global
+  dry_run:
+    description: "Log the comment body but do not post it"
+    required: false
+    default: "false"
+  step_summary:
+    description: "Write the summary to the GitHub Actions Step Summary"
+    required: false
+    default: "false"
+  enable_size:
+    description: "Enable the size analysis section"
+    required: false
+    default: "true"
+  enable_state:
+    description: "Enable the PR state explanation section"
+    required: false
+    default: "true"
+  enable_reviewer:
+    description: "Enable the reviewer suggestion section"
+    required: false
+    default: "true"
+
+  # Size
   max_files:
+    description: "Max PR files to inspect for size analysis"
     required: false
     default: "500"
   add_label:
     description: "Add a size label (size:XS … size:XL) to the PR"
     required: false
     default: "false"
-  step_summary:
-    description: "Write the size summary to the GitHub Actions Step Summary"
-    required: false
-    default: "false"
   ignore_patterns:
     description: "Comma-separated glob patterns for generated/lock files to exclude from size calculation"
     required: false
     default: "dist/**,*.min.js,*.min.css,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*"
-
   xs_lines:
     required: false
     default: "50"
@@ -31,7 +51,6 @@ inputs:
   l_lines:
     required: false
     default: "1000"
-
   xs_files:
     required: false
     default: "2"
@@ -45,6 +64,94 @@ inputs:
     required: false
     default: "30"
 
+  # State
+  stale_days:
+    description: "Days without activity before PR is considered stale"
+    required: false
+    default: "3"
+  comment_only_when_stale:
+    description: "Only post the comment when the PR is stale"
+    required: false
+    default: "false"
+  max_checks:
+    description: "Maximum number of checks to inspect"
+    required: false
+    default: "50"
+  stale_overrides:
+    description: 'JSON map of label → custom stale days (e.g., {"wip": 14, "urgent": 1})'
+    required: false
+    default: ""
+  review_latency:
+    description: "Show how long reviews have been pending"
+    required: false
+    default: "false"
+  language:
+    description: "Comment language (en, de, es)"
+    required: false
+    default: "en"
+  sweep_stale:
+    description: "Scan all open PRs for staleness (use with schedule trigger)"
+    required: false
+    default: "false"
+  max_prs:
+    description: "Maximum PRs to scan during stale sweep"
+    required: false
+    default: "50"
+
+  # Reviewer
+  max_reviewers:
+    description: "Maximum number of reviewers to suggest"
+    required: false
+    default: "3"
+  lookback_days:
+    description: "Commit history lookback in days"
+    required: false
+    default: "90"
+  reviewer_max_files:
+    description: "Max changed files to inspect for reviewer suggestions"
+    required: false
+    default: "50"
+  use_codeowners:
+    description: "Boost CODEOWNERS matches in reviewer ranking"
+    required: false
+    default: "true"
+  use_latency:
+    description: "Boost fast reviewers based on historical review latency"
+    required: false
+    default: "true"
+  latency_prs:
+    description: "Number of closed PRs sampled for latency computation"
+    required: false
+    default: "20"
+  penalize_load:
+    description: "Penalize candidates with many open review requests"
+    required: false
+    default: "true"
+  exclude_reviewers:
+    description: "Comma-separated list of reviewers to exclude"
+    required: false
+    default: ""
+  cross_repo_list:
+    description: "Comma-separated repo names (same owner) to check for cross-repo expertise"
+    required: false
+    default: ""
+  required_reviewers:
+    description: "Comma-separated reviewers that must always appear in suggestions"
+    required: false
+    default: ""
+  prefer_timezone:
+    description: "Preferred timezone offset (e.g., UTC+1, UTC-5) to boost matching reviewers"
+    required: false
+    default: ""
+  show_breakdown:
+    description: "Show a signal breakdown table in the reviewer section"
+    required: false
+    default: "false"
+  detect_flaky:
+    description: "Detect and penalize reviewers who are frequently requested but rarely review"
+    required: false
+    default: "false"
+
 outputs:
   size:
     description: "Computed size bucket (XS, S, M, L, XL)"
@@ -54,6 +161,8 @@ outputs:
     description: "Number of files changed"
   pr_age_hours:
     description: "PR age in hours since creation"
+  suggestions_json:
+    description: "JSON array of reviewer suggestions (when dry_run is enabled)"
 runs:
   using: "node20"
   main: "dist/index.js"

@@ -58714,6 +58714,1372 @@ module.exports = require("zlib");
 
 /***/ }),
 
+/***/ 6258:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const core = __nccwpck_require__(7484);
+const minimatch = __nccwpck_require__(6507);
+
+// -------------------- Utilities --------------------
+
+function isBotLogin(login) {
+  if (!login) return true;
+  const l = login.toLowerCase();
+  return login.endsWith("[bot]") || l.includes("bot") || l === "github-actions";
+}
+
+function parseCommaSeparated(s) {
+  return (s || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+}
+
+function daysAgoISO(days) {
+  const d = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  return d.toISOString();
+}
+
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function median(arr) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// -------------------- GitHub fetch helpers --------------------
+
+async function topCommitAuthorsForPath(octokit, { owner, repo, path, sinceISO, perFileCommitCap = 30 }) {
+  const resp = await octokit.rest.repos.listCommits({
+    owner, repo, path, since: sinceISO, per_page: perFileCommitCap
+  });
+
+  const authors = [];
+  for (const c of resp.data) {
+    const login = c.author?.login || null;
+    if (login && !isBotLogin(login)) authors.push(login);
+  }
+  return authors;
+}
+
+// -------------------- CODEOWNERS support --------------------
+
+const CODEOWNERS_CANDIDATE_PATHS = [
+  ".github/CODEOWNERS",
+  "CODEOWNERS",
+  "docs/CODEOWNERS"
+];
+
+async function tryFetchFileText(octokit, { owner, repo, path, ref }) {
+  try {
+    const resp = await octokit.rest.repos.getContent({ owner, repo, path, ref });
+    if (!resp.data || Array.isArray(resp.data) || !resp.data.content) return null;
+    const buf = Buffer.from(resp.data.content, resp.data.encoding || "base64");
+    return buf.toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function parseCodeowners(text) {
+  const rules = [];
+  if (!text) return rules;
+
+  const lines = text.split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const noInline = line.split(/\s+#/)[0].trim();
+    if (!noInline) continue;
+
+    const parts = noInline.split(/\s+/).filter(Boolean);
+    if (parts.length < 2) continue;
+
+    const pattern = parts[0];
+    const rawOwners = parts.slice(1).map((o) => o.replace(/^@/, "").trim()).filter(Boolean);
+    const owners = rawOwners.filter((o) => !isBotLogin(o));
+    const teams = rawOwners.filter((o) => o.includes("/"));
+
+    if (!owners.length) continue;
+    rules.push({ pattern, owners, teams });
+  }
+
+  return rules;
+}
+
+function normalizeCodeownersPattern(pattern) {
+  if (pattern.startsWith("/")) return pattern.slice(1);
+  return `**/${pattern}`;
+}
+
+function ownersForFile(codeownersRules, filePath) {
+  if (!codeownersRules.length) return [];
+  let matchedOwners = [];
+
+  for (const r of codeownersRules) {
+    const pat = normalizeCodeownersPattern(r.pattern);
+    if (minimatch(filePath, pat, { dot: true, nocase: false, matchBase: true })) {
+      matchedOwners = r.owners;
+    }
+  }
+  return matchedOwners;
+}
+
+// -------------------- Review latency scoring --------------------
+
+async function computeReviewerLatencyHours(octokit, { owner, repo, lookbackDays, maxClosedPRs = 20 }) {
+  const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
+
+  const pulls = await octokit.rest.pulls.list({
+    owner, repo, state: "closed", sort: "updated", direction: "desc", per_page: maxClosedPRs
+  });
+
+  const perReviewer = new Map();
+
+  for (const pr of pulls.data) {
+    if (!pr.merged_at && !pr.closed_at) continue;
+    const createdAt = new Date(pr.created_at);
+    if (createdAt < since) continue;
+
+    let reviewsResp;
+    try {
+      reviewsResp = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: pr.number, per_page: 100 });
+    } catch {
+      continue;
+    }
+
+    const firstByUser = new Map();
+    for (const r of reviewsResp.data) {
+      const login = r.user?.login;
+      if (!login || isBotLogin(login)) continue;
+      if (!r.submitted_at) continue;
+      const t = new Date(r.submitted_at);
+      const existing = firstByUser.get(login);
+      if (!existing || t < existing) firstByUser.set(login, t);
+    }
+
+    for (const [login, t] of firstByUser.entries()) {
+      const hours = (t.getTime() - createdAt.getTime()) / (1000 * 60 * 60);
+      if (!Number.isFinite(hours) || hours < 0) continue;
+      if (!perReviewer.has(login)) perReviewer.set(login, []);
+      perReviewer.get(login).push(hours);
+    }
+  }
+
+  const out = new Map();
+  for (const [login, arr] of perReviewer.entries()) {
+    const m = median(arr);
+    if (m != null) out.set(login, m);
+  }
+  return out;
+}
+
+function latencyBonusHours(medianHours) {
+  if (medianHours == null) return 0;
+  if (medianHours <= 4) return 6;
+  if (medianHours <= 12) return 4;
+  if (medianHours <= 24) return 2;
+  if (medianHours <= 48) return 1;
+  return 0;
+}
+
+// -------------------- Review load --------------------
+
+async function computeOpenReviewCounts(octokit, { owner, repo }) {
+  const pulls = await octokit.rest.pulls.list({ owner, repo, state: "open", per_page: 100 });
+
+  const counts = new Map();
+  for (const pr of pulls.data) {
+    for (const reviewer of (pr.requested_reviewers || [])) {
+      const login = reviewer.login;
+      if (!login) continue;
+      counts.set(login, (counts.get(login) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function applyLoadPenalty(score, openReviews) {
+  return score * (1 / (1 + openReviews / 3));
+}
+
+// -------------------- Reviewer exclusion --------------------
+
+async function fetchExcludedReviewers(octokit, { owner, repo, ref, inputExcludes }) {
+  const excluded = new Set(inputExcludes.map((s) => s.toLowerCase()));
+
+  try {
+    const text = await tryFetchFileText(octokit, { owner, repo, path: ".github/reviewer-config.yml", ref });
+    if (text) {
+      const inlineMatch = text.match(/exclude:\s*\[([^\]]+)\]/);
+      if (inlineMatch) {
+        inlineMatch[1].split(",").forEach((u) => {
+          const trimmed = u.trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+          if (trimmed) excluded.add(trimmed);
+        });
+      } else {
+        const lines = text.split(/\r?\n/);
+        let inExclude = false;
+        for (const line of lines) {
+          if (/^exclude:/i.test(line.trim())) { inExclude = true; continue; }
+          if (inExclude && /^\s+-\s+/.test(line)) {
+            const user = line.replace(/^\s+-\s+/, "").trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+            if (user) excluded.add(user);
+          } else if (inExclude && /^\S/.test(line)) {
+            inExclude = false;
+          }
+        }
+      }
+    }
+  } catch {
+    // best effort
+  }
+
+  return excluded;
+}
+
+// -------------------- Cross-repo expertise --------------------
+
+async function fetchCrossRepoExpertise(octokit, { owner, repos, filePaths, sinceISO }) {
+  const expertise = new Map();
+
+  for (const repoName of repos) {
+    for (const filePath of filePaths.slice(0, 5)) {
+      try {
+        const resp = await octokit.rest.repos.listCommits({
+          owner, repo: repoName, path: filePath, since: sinceISO, per_page: 10
+        });
+
+        for (const c of resp.data) {
+          const login = c.author?.login;
+          if (!login || isBotLogin(login)) continue;
+          expertise.set(login, (expertise.get(login) || 0) + 1);
+        }
+      } catch {
+        // repo may not exist or file may not exist
+      }
+    }
+  }
+
+  return expertise;
+}
+
+// -------------------- Timezone awareness --------------------
+
+function parseTimezoneOffset(tz) {
+  if (!tz) return null;
+  const match = tz.match(/UTC([+-]?\d+)/i);
+  if (match) return parseInt(match[1], 10);
+  return null;
+}
+
+function timezoneBonus(avgHourUTC, preferredOffsetHours) {
+  if (avgHourUTC == null || preferredOffsetHours == null) return 0;
+  const preferredCenterUTC = (14 - preferredOffsetHours + 24) % 24;
+  const diff = Math.abs(avgHourUTC - preferredCenterUTC);
+  const wrappedDiff = Math.min(diff, 24 - diff);
+  if (wrappedDiff <= 4) return 3;
+  if (wrappedDiff <= 8) return 1;
+  return 0;
+}
+
+// -------------------- Flaky reviewer detection --------------------
+
+async function detectFlakyReviewers(octokit, { owner, repo, lookbackDays, maxPRs = 30 }) {
+  const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
+  const pulls = await octokit.rest.pulls.list({
+    owner, repo, state: "closed", sort: "updated", direction: "desc", per_page: maxPRs
+  });
+
+  const requestedCounts = new Map();
+  const reviewedCounts = new Map();
+
+  for (const pr of pulls.data) {
+    if (new Date(pr.created_at) < since) continue;
+
+    let reviewsResp;
+    try {
+      reviewsResp = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: pr.number, per_page: 100 });
+    } catch {
+      continue;
+    }
+
+    const reviewed = new Set();
+    for (const r of reviewsResp.data) {
+      const login = r.user?.login;
+      if (login) reviewed.add(login.toLowerCase());
+    }
+
+    for (const login of reviewed) {
+      reviewedCounts.set(login, (reviewedCounts.get(login) || 0) + 1);
+    }
+  }
+
+  const openPulls = await octokit.rest.pulls.list({ owner, repo, state: "open", per_page: 50 });
+
+  for (const pr of openPulls.data) {
+    for (const reviewer of (pr.requested_reviewers || [])) {
+      const login = (reviewer.login || "").toLowerCase();
+      if (login) requestedCounts.set(login, (requestedCounts.get(login) || 0) + 1);
+    }
+  }
+
+  const flaky = new Set();
+  for (const [login, requested] of requestedCounts) {
+    const reviewed = reviewedCounts.get(login) || 0;
+    if (requested >= 3 && reviewed < requested) {
+      flaky.add(login);
+    }
+  }
+
+  return flaky;
+}
+
+// -------------------- Ranking --------------------
+
+function rankCandidates({ fileAuthors, prAuthor, codeownersRules, changedFiles, latencyMap, weights, crossRepoExpertise, timezoneData, requiredReviewers }) {
+  const scores = new Map();
+  const reasons = new Map();
+
+  const add = (login, pts, reason) => {
+    if (!login || isBotLogin(login)) return;
+    if (login === prAuthor) return;
+    scores.set(login, (scores.get(login) || 0) + pts);
+    if (!reasons.has(login)) reasons.set(login, new Set());
+    if (reason) reasons.get(login).add(reason);
+  };
+
+  for (const { authors } of fileAuthors) {
+    const max = Math.min(authors.length, 10);
+    for (let i = 0; i < max; i++) {
+      const w = Math.max(1, 3 - i);
+      add(authors[i], w * weights.commitHistory, "recent commits");
+    }
+  }
+
+  if (weights.codeowners > 0 && codeownersRules.length) {
+    const seen = new Set();
+    for (const f of changedFiles) {
+      const owners = ownersForFile(codeownersRules, f);
+      for (const o of owners) {
+        if (!o) continue;
+        const key = `${o}::${f}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        add(o, weights.codeowners, "CODEOWNERS");
+      }
+    }
+  }
+
+  if (weights.latency > 0 && latencyMap && latencyMap.size) {
+    for (const [login, medHrs] of latencyMap.entries()) {
+      const bonus = latencyBonusHours(medHrs) * weights.latency;
+      if (bonus > 0) add(login, bonus, `fast reviewer (~${Math.round(medHrs)}h median)`);
+    }
+  }
+
+  if (crossRepoExpertise && crossRepoExpertise.size > 0) {
+    for (const [login, count] of crossRepoExpertise) {
+      add(login, Math.min(count, 5), "cross-repo expertise");
+    }
+  }
+
+  if (timezoneData && timezoneData.preferredOffset != null) {
+    for (const [login, avgHour] of (timezoneData.avgHours || new Map())) {
+      const bonus = timezoneBonus(avgHour, timezoneData.preferredOffset);
+      if (bonus > 0) add(login, bonus, "timezone match");
+    }
+  }
+
+  if (requiredReviewers && requiredReviewers.length > 0) {
+    for (const login of requiredReviewers) {
+      if (login === prAuthor || isBotLogin(login)) continue;
+      const current = scores.get(login) || 0;
+      if (current === 0) add(login, 10, "required reviewer");
+      else add(login, 5, "required reviewer");
+    }
+  }
+
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([login, score]) => ({
+      login,
+      score,
+      reasons: [...(reasons.get(login) || [])]
+    }));
+}
+
+// -------------------- Confidence --------------------
+
+function computeConfidence({ ranked, changedFiles, codeownersRules, fileAuthors }) {
+  const top = ranked[0]?.score || 0;
+  const second = ranked[1]?.score || 0;
+
+  let covered = 0;
+  const byFileHasSignal = new Map(changedFiles.map((f) => [f, false]));
+
+  if (fileAuthors.length) {
+    const approx = Math.min(changedFiles.length, Math.max(1, Math.floor(fileAuthors.length)));
+    covered = Math.max(covered, approx);
+  }
+
+  if (codeownersRules.length) {
+    for (const f of changedFiles) {
+      if (ownersForFile(codeownersRules, f).length) byFileHasSignal.set(f, true);
+    }
+  }
+
+  const codeownersCovered = [...byFileHasSignal.values()].filter(Boolean).length;
+  covered = Math.max(covered, codeownersCovered);
+
+  const coverageRatio = changedFiles.length ? covered / changedFiles.length : 0;
+  const separation = top > 0 ? (top - second) / top : 0;
+
+  if (top >= 12 && coverageRatio >= 0.5 && separation >= 0.25) return "High";
+  if (top >= 6 && coverageRatio >= 0.25) return "Medium";
+  return "Low";
+}
+
+// -------------------- Comment formatting --------------------
+
+function formatReviewerSection({ suggestions, lookbackDays, maxFiles, fileCount, confidence, teamCoverage, showBreakdown }) {
+  let section = `#### Reviewer Suggestions\n\n`;
+  section +=
+    `Based on:\n` +
+    `- commit history in the last **${lookbackDays} days**\n` +
+    `- changed files: **${Math.min(fileCount, maxFiles)}**\n` +
+    `- confidence: **${confidence}**\n\n`;
+
+  if (suggestions.length === 0) {
+    section += "No strong candidates found (not enough history, no CODEOWNERS match, or only bots/author matched).\n";
+    return section;
+  }
+
+  const list = suggestions
+    .map((s) => {
+      const why = s.reasons?.length ? ` — ${s.reasons.join(", ")}` : "";
+      const loadStr = s.openReviews != null ? `, ${s.openReviews} open reviews` : "";
+      return `- @${s.login} (score: ${s.score}${loadStr})${why}`;
+    })
+    .join("\n");
+
+  section += list;
+
+  if (teamCoverage && teamCoverage.length > 0) {
+    section += "\n\n**Team coverage:**\n" +
+      teamCoverage.map((t) => `- ${t.team}: ${t.count}/${t.total} suggestions`).join("\n") +
+      "\n";
+  }
+
+  if (showBreakdown && suggestions.length > 0) {
+    section += "\n\n**Signal breakdown:**\n\n";
+    section += "| Reviewer | Score | Signals |\n";
+    section += "|----------|------:|--------|\n";
+    for (const s of suggestions) {
+      const signals = s.reasons?.join(", ") || "-";
+      const loadStr = s.openReviews != null ? ` (${s.openReviews} open)` : "";
+      section += `| @${s.login} | ${s.score}${loadStr} | ${signals} |\n`;
+    }
+  }
+
+  section += `\n_Notes: excludes PR author and bots; heuristic-based._\n`;
+  return section;
+}
+
+// -------------------- Main reviewer analysis --------------------
+
+async function analyzeReviewers(octokit, { owner, repo, prNumber, prAuthor, prHeadSha, files, reviews, config }) {
+  const {
+    maxReviewers, lookbackDays, maxFiles, useCodeowners, useLatency, latencyPRs,
+    penalizeLoad, excludeReviewersInput, crossRepoList, requiredReviewers,
+    preferTimezone, showBreakdown, detectFlaky
+  } = config;
+
+  const changedFiles = files.map((f) => f.filename);
+  const sinceISO = daysAgoISO(lookbackDays);
+
+  const weights = {
+    commitHistory: 1,
+    codeowners: useCodeowners ? 4 : 0,
+    latency: useLatency ? 1 : 0
+  };
+
+  // CODEOWNERS
+  let codeownersRules = [];
+  if (useCodeowners) {
+    const ref = prHeadSha || undefined;
+    let codeownersText = null;
+    for (const p of CODEOWNERS_CANDIDATE_PATHS) {
+      codeownersText = await tryFetchFileText(octokit, { owner, repo, path: p, ref });
+      if (codeownersText) break;
+    }
+    codeownersRules = parseCodeowners(codeownersText);
+    core.info(`CODEOWNERS rules loaded: ${codeownersRules.length}`);
+  }
+
+  // Commit history
+  const fileAuthors = [];
+  const filesToCheck = changedFiles.slice(0, maxFiles);
+  for (const path of filesToCheck) {
+    try {
+      const authors = await topCommitAuthorsForPath(octokit, { owner, repo, path, sinceISO });
+      if (authors.length) fileAuthors.push({ path, authors });
+    } catch (e) {
+      core.warning(`Failed commit lookup for ${path}: ${e?.message || e}`);
+    }
+  }
+
+  // Review latency
+  let latencyMap = new Map();
+  if (useLatency) {
+    try {
+      latencyMap = await computeReviewerLatencyHours(octokit, {
+        owner, repo, lookbackDays, maxClosedPRs: clamp(latencyPRs, 5, 50)
+      });
+      core.info(`Latency entries computed: ${latencyMap.size}`);
+    } catch (e) {
+      core.warning(`Latency computation failed (continuing): ${e?.message || e}`);
+    }
+  }
+
+  // Exclusions
+  const excluded = await fetchExcludedReviewers(octokit, {
+    owner, repo, ref: prHeadSha, inputExcludes: excludeReviewersInput
+  });
+  if (excluded.size > 0) {
+    core.info(`Excluded reviewers: ${[...excluded].join(", ")}`);
+  }
+
+  // Cross-repo expertise
+  let crossRepoExpertise = new Map();
+  if (crossRepoList.length > 0) {
+    try {
+      crossRepoExpertise = await fetchCrossRepoExpertise(octokit, {
+        owner, repos: crossRepoList, filePaths: changedFiles, sinceISO
+      });
+      core.info(`Cross-repo expertise entries: ${crossRepoExpertise.size}`);
+    } catch (e) {
+      core.warning(`Cross-repo expertise failed (continuing): ${e?.message || e}`);
+    }
+  }
+
+  // Timezone awareness
+  let timezoneData = null;
+  const preferredOffset = parseTimezoneOffset(preferTimezone);
+  if (preferredOffset != null) {
+    const avgHours = new Map();
+    for (const { path: fp } of fileAuthors) {
+      try {
+        const resp = await octokit.rest.repos.listCommits({
+          owner, repo, path: fp, since: sinceISO, per_page: 10
+        });
+        for (const c of resp.data) {
+          const login = c.author?.login;
+          const date = c.commit?.author?.date;
+          if (!login || !date) continue;
+          if (!avgHours.has(login)) avgHours.set(login, []);
+          avgHours.get(login).push(new Date(date).getUTCHours());
+        }
+      } catch {
+        // best effort
+      }
+    }
+    const avgHourMap = new Map();
+    for (const [login, hours] of avgHours) {
+      const avg = Math.round(hours.reduce((a, b) => a + b, 0) / hours.length);
+      avgHourMap.set(login, avg);
+    }
+    timezoneData = { preferredOffset, avgHours: avgHourMap };
+    core.info(`Timezone data computed for ${avgHourMap.size} authors`);
+  }
+
+  // Flaky reviewer detection
+  let flakyReviewers = new Set();
+  if (detectFlaky) {
+    try {
+      flakyReviewers = await detectFlakyReviewers(octokit, { owner, repo, lookbackDays });
+      if (flakyReviewers.size > 0) {
+        core.info(`Flaky reviewers detected: ${[...flakyReviewers].join(", ")}`);
+      }
+    } catch (e) {
+      core.warning(`Flaky detection failed (continuing): ${e?.message || e}`);
+    }
+  }
+
+  // Rank + pick
+  let ranked = rankCandidates({
+    fileAuthors, prAuthor, codeownersRules, changedFiles: filesToCheck,
+    latencyMap, weights, crossRepoExpertise, timezoneData, requiredReviewers
+  });
+
+  ranked = ranked.filter((r) => !excluded.has(r.login.toLowerCase()));
+
+  // Review load awareness
+  if (penalizeLoad) {
+    try {
+      const loadCounts = await computeOpenReviewCounts(octokit, { owner, repo });
+      for (const r of ranked) {
+        const openReviews = loadCounts.get(r.login) || 0;
+        r.openReviews = openReviews;
+        r.score = Math.round(applyLoadPenalty(r.score, openReviews));
+      }
+      ranked.sort((a, b) => b.score - a.score);
+    } catch (e) {
+      core.warning(`Load computation failed (continuing): ${e?.message || e}`);
+    }
+  }
+
+  // Apply flaky reviewer penalty
+  if (flakyReviewers.size > 0) {
+    for (const r of ranked) {
+      if (flakyReviewers.has(r.login.toLowerCase())) {
+        r.score = Math.round(r.score * 0.5);
+        r.reasons = [...(r.reasons || []), "flaky reviewer"];
+      }
+    }
+    ranked.sort((a, b) => b.score - a.score);
+  }
+
+  const suggestions = ranked.slice(0, maxReviewers);
+  const confidence = computeConfidence({ ranked, changedFiles: filesToCheck, codeownersRules, fileAuthors });
+
+  // Team-level coverage
+  let teamCoverage = [];
+  if (codeownersRules.length > 0) {
+    const allTeams = new Set();
+    for (const r of codeownersRules) {
+      for (const t of (r.teams || [])) allTeams.add(t);
+    }
+
+    const suggestionLogins = new Set(suggestions.map((s) => s.login.toLowerCase()));
+    for (const team of allTeams) {
+      const teamMembers = new Set();
+      for (const r of codeownersRules) {
+        if ((r.teams || []).includes(team)) {
+          for (const o of r.owners) teamMembers.add(o.toLowerCase());
+        }
+      }
+      const count = [...teamMembers].filter((m) => suggestionLogins.has(m)).length;
+      if (teamMembers.size > 0) {
+        teamCoverage.push({ team, count, total: suggestions.length });
+      }
+    }
+  }
+
+  return { suggestions, confidence, teamCoverage, lookbackDays, maxFiles, fileCount: changedFiles.length, showBreakdown };
+}
+
+module.exports = {
+  parseCommaSeparated,
+  analyzeReviewers,
+  formatReviewerSection
+};
+
+
+/***/ }),
+
+/***/ 1827:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const { minimatch } = __nccwpck_require__(6507);
+const { fmt } = __nccwpck_require__(3008);
+
+const SIZE_ORDER = ["XS", "S", "M", "L", "XL"];
+
+function bucketByThresholds(value, thresholds) {
+  for (const t of thresholds) {
+    if (value <= t.max) return t.name;
+  }
+  return "XL";
+}
+
+function maxBucket(a, b) {
+  return SIZE_ORDER[Math.max(SIZE_ORDER.indexOf(a), SIZE_ORDER.indexOf(b))];
+}
+
+const DEFAULT_IGNORE = "dist/**,*.min.js,*.min.css,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*";
+
+function parseIgnorePatterns(raw) {
+  return raw
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+function filterIgnoredFiles(files, patterns) {
+  if (patterns.length === 0) return { counted: files, ignoredCount: 0 };
+
+  const counted = [];
+  let ignoredCount = 0;
+
+  for (const f of files) {
+    const ignored = patterns.some((p) => minimatch(f.filename, p, { matchBase: true }));
+    if (ignored) {
+      ignoredCount++;
+    } else {
+      counted.push(f);
+    }
+  }
+
+  return { counted, ignoredCount };
+}
+
+function topChangedDirectories(files, maxDepth, limit) {
+  const dirMap = new Map();
+
+  for (const f of files) {
+    const segments = f.filename.split("/");
+    const dir = segments.length <= maxDepth
+      ? segments.slice(0, -1).join("/") || "."
+      : segments.slice(0, maxDepth).join("/");
+    const prev = dirMap.get(dir) || { files: 0, lines: 0 };
+    prev.files += 1;
+    prev.lines += (f.additions || 0) + (f.deletions || 0);
+    dirMap.set(dir, prev);
+  }
+
+  return [...dirMap.entries()]
+    .sort((a, b) => b[1].lines - a[1].lines)
+    .slice(0, limit)
+    .map(([dir, stats]) => ({ dir, ...stats }));
+}
+
+function formatDirectoryTable(dirs) {
+  if (dirs.length === 0) return "";
+  let table = "\n**Top changed directories:**\n\n";
+  table += "| Directory | Files | Lines |\n";
+  table += "|-----------|------:|------:|\n";
+  for (const d of dirs) {
+    table += `| \`${d.dir}\` | ${d.files} | ${fmt(d.lines)} |\n`;
+  }
+  return table;
+}
+
+function buildSplitRecommendation(files, size) {
+  if (size !== "L" && size !== "XL") return "";
+
+  const topDirMap = new Map();
+  for (const f of files) {
+    const dir = f.filename.split("/").slice(0, 2).join("/") || ".";
+    const prev = topDirMap.get(dir) || 0;
+    topDirMap.set(dir, prev + (f.additions || 0) + (f.deletions || 0));
+  }
+
+  const sorted = [...topDirMap.entries()].sort((a, b) => b[1] - a[1]);
+  if (sorted.length < 2) return "";
+
+  const parts = [];
+  parts.push("\n**Split recommendation:** This PR is large — consider splitting it:");
+  const top3 = sorted.slice(0, 3);
+  for (const [dir, lines] of top3) {
+    parts.push(`- \`${dir}\` (${fmt(lines)} lines)`);
+  }
+  parts.push("");
+  return parts.join("\n");
+}
+
+const SIZE_LABEL_PREFIX = "size:";
+
+async function applySizeLabel(octokit, { owner, repo, prNumber, size }) {
+  const targetLabel = SIZE_LABEL_PREFIX + size;
+
+  const { data: currentLabels } = await octokit.rest.issues.listLabelsOnIssue({
+    owner,
+    repo,
+    issue_number: prNumber,
+    per_page: 100
+  });
+
+  const staleLabels = currentLabels.filter(
+    (l) => l.name.startsWith(SIZE_LABEL_PREFIX) && l.name !== targetLabel
+  );
+
+  for (const label of staleLabels) {
+    await octokit.rest.issues.removeLabel({
+      owner,
+      repo,
+      issue_number: prNumber,
+      name: label.name
+    });
+  }
+
+  const alreadyApplied = currentLabels.some((l) => l.name === targetLabel);
+  if (!alreadyApplied) {
+    await octokit.rest.issues.addLabels({
+      owner,
+      repo,
+      issue_number: prNumber,
+      labels: [targetLabel]
+    });
+  }
+}
+
+function analyzeSize({ files, thresholds }) {
+  let additions = 0;
+  let deletions = 0;
+
+  for (const f of files) {
+    additions += f.additions || 0;
+    deletions += f.deletions || 0;
+  }
+
+  const fileCount = files.length;
+  const totalChanged = additions + deletions;
+
+  const lineBucket = bucketByThresholds(totalChanged, [
+    { name: "XS", max: thresholds.xsLines },
+    { name: "S", max: thresholds.sLines },
+    { name: "M", max: thresholds.mLines },
+    { name: "L", max: thresholds.lLines }
+  ]);
+
+  const fileBucket = bucketByThresholds(fileCount, [
+    { name: "XS", max: thresholds.xsFiles },
+    { name: "S", max: thresholds.sFiles },
+    { name: "M", max: thresholds.mFiles },
+    { name: "L", max: thresholds.lFiles }
+  ]);
+
+  const size = maxBucket(lineBucket, fileBucket);
+  const topDirs = topChangedDirectories(files, 2, 5);
+
+  return { additions, deletions, fileCount, totalChanged, size, topDirs };
+}
+
+function formatSizeSection({ additions, deletions, fileCount, totalChanged, size, ignoredCount, topDirs, files }) {
+  const dirSection = formatDirectoryTable(topDirs);
+  const splitSection = buildSplitRecommendation(files, size);
+
+  let section = "";
+  section += `#### Size Summary\n\n`;
+  section += `Files changed: **${fmt(fileCount)}**\n\n`;
+  section += `Lines added: **+${fmt(additions)}**  \n`;
+  section += `Lines removed: **-${fmt(deletions)}**  \n`;
+  section += `Total changed: **${fmt(totalChanged)}**\n\n`;
+  section += `Size: **${size}**\n`;
+  if (ignoredCount > 0) {
+    section += `_(${ignoredCount} generated/lock file${ignoredCount === 1 ? "" : "s"} excluded)_\n`;
+  }
+  section += dirSection;
+  section += splitSection;
+  section += `\n_Notes: size is based on the larger of file-count bucket and line-change bucket._\n`;
+
+  return section;
+}
+
+module.exports = {
+  DEFAULT_IGNORE,
+  parseIgnorePatterns,
+  filterIgnoredFiles,
+  analyzeSize,
+  formatSizeSection,
+  applySizeLabel
+};
+
+
+/***/ }),
+
+/***/ 1917:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const core = __nccwpck_require__(7484);
+const { clampInt } = __nccwpck_require__(3008);
+
+// -------------------- Localization --------------------
+
+const TRANSLATIONS = {
+  en: {
+    title: "PR State",
+    lastActivity: "Last activity",
+    draft: "Draft",
+    mergeable: "Mergeable",
+    likelyConflicts: "Likely conflicting files",
+    checks: "Checks",
+    noChecks: "no checks reported",
+    failing: "failing",
+    running: "running",
+    totals: "totals",
+    reviews: "Reviews",
+    approvals: "approvals",
+    changesRequested: "changes requested",
+    requested: "requested",
+    none: "none",
+    blocking: "What's blocking this PR",
+    nothingBlocking: "Nothing obvious. This PR looks ready to merge.",
+    nextAction: "Next action expected from",
+    notes: "heuristic-based; intended as a quick explanation, not a policy.",
+    reviewLatency: "Review pending for",
+    noReviewers: "No reviewers assigned — consider requesting a review.",
+    unknown: "unknown (GitHub still calculating)",
+    yes: "yes",
+    no: "no"
+  },
+  de: {
+    title: "PR-Status",
+    lastActivity: "Letzte Aktivitat",
+    draft: "Entwurf",
+    mergeable: "Mergebar",
+    likelyConflicts: "Wahrscheinlich konfliktbehaftete Dateien",
+    checks: "Checks",
+    noChecks: "keine Checks gemeldet",
+    failing: "fehlgeschlagen",
+    running: "laufend",
+    totals: "gesamt",
+    reviews: "Reviews",
+    approvals: "Genehmigungen",
+    changesRequested: "Anderungen angefordert",
+    requested: "angefragt",
+    none: "keine",
+    blocking: "Was diese PR blockiert",
+    nothingBlocking: "Nichts Offensichtliches. Diese PR sieht bereit zum Mergen aus.",
+    nextAction: "Nachste Aktion erwartet von",
+    notes: "heuristikbasiert; als schnelle Erklarung gedacht, nicht als Richtlinie.",
+    reviewLatency: "Review ausstehend seit",
+    noReviewers: "Keine Reviewer zugewiesen — erwagen Sie, ein Review anzufordern.",
+    unknown: "unbekannt (GitHub berechnet noch)",
+    yes: "ja",
+    no: "nein"
+  },
+  es: {
+    title: "Estado del PR",
+    lastActivity: "Ultima actividad",
+    draft: "Borrador",
+    mergeable: "Fusionable",
+    likelyConflicts: "Archivos probablemente en conflicto",
+    checks: "Checks",
+    noChecks: "sin checks reportados",
+    failing: "fallando",
+    running: "ejecutando",
+    totals: "totales",
+    reviews: "Revisiones",
+    approvals: "aprobaciones",
+    changesRequested: "cambios solicitados",
+    requested: "solicitados",
+    none: "ninguno",
+    blocking: "Que bloquea este PR",
+    nothingBlocking: "Nada obvio. Este PR parece listo para fusionar.",
+    nextAction: "Proxima accion esperada de",
+    notes: "basado en heuristicas; como explicacion rapida, no como politica.",
+    reviewLatency: "Revision pendiente desde hace",
+    noReviewers: "Sin revisores asignados — considere solicitar una revision.",
+    unknown: "desconocido (GitHub aun calculando)",
+    yes: "si",
+    no: "no"
+  }
+};
+
+function getTranslator(lang) {
+  return TRANSLATIONS[lang] || TRANSLATIONS.en;
+}
+
+// -------------------- Helpers --------------------
+
+function daysBetween(a, b) {
+  const ms = Math.abs(a.getTime() - b.getTime());
+  return ms / (1000 * 60 * 60 * 24);
+}
+
+function fmtAgeDays(d) {
+  if (d < 1) return "today";
+  if (d < 2) return "1 day ago";
+  return `${Math.floor(d)} days ago`;
+}
+
+function summarizeChecks(runs) {
+  const counts = { success: 0, failure: 0, neutral: 0, cancelled: 0, skipped: 0, timed_out: 0, action_required: 0, stale: 0, in_progress: 0, queued: 0, unknown: 0 };
+  for (const r of runs) {
+    const c = r.conclusion || (r.status === "completed" ? "unknown" : r.status);
+    if (counts[c] == null) counts.unknown++;
+    else counts[c]++;
+  }
+
+  const failing = runs
+    .filter((r) => (r.conclusion || "") === "failure")
+    .slice(0, 5)
+    .map((r) => r.name);
+
+  const inProgress = runs
+    .filter((r) => r.status && r.status !== "completed")
+    .slice(0, 5)
+    .map((r) => r.name);
+
+  return { counts, failing, inProgress };
+}
+
+function classifyState({ pr, checksSummary, reviewsSummary, staleDays, ageDays }) {
+  const blockers = [];
+  const nextActors = new Set();
+  const prAuthor = pr.user?.login;
+
+  if (pr.draft) {
+    blockers.push("PR is **Draft**.");
+    if (prAuthor) nextActors.add(`@${prAuthor}`);
+  }
+
+  if (pr.mergeable === false) {
+    blockers.push("PR has **merge conflicts**.");
+    if (prAuthor) nextActors.add(`@${prAuthor}`);
+  }
+
+  if (checksSummary.failing.length) {
+    blockers.push(`CI failing: ${checksSummary.failing.map((n) => `\`${n}\``).join(", ")}`);
+    if (prAuthor) nextActors.add(`@${prAuthor}`);
+  }
+
+  if (checksSummary.inProgress.length) {
+    blockers.push(`CI still running: ${checksSummary.inProgress.map((n) => `\`${n}\``).join(", ")}`);
+  }
+
+  if (reviewsSummary.requestedChanges > 0) {
+    blockers.push(`Changes requested (${reviewsSummary.requestedChanges}).`);
+    if (prAuthor) nextActors.add(`@${prAuthor}`);
+  } else if (reviewsSummary.approvals === 0 && reviewsSummary.requestedReviewers.length) {
+    blockers.push(`Awaiting review from: ${reviewsSummary.requestedReviewers.map((u) => `@${u}`).join(", ")}`);
+    for (const u of reviewsSummary.requestedReviewers) {
+      nextActors.add(u.startsWith("@") ? u : `@${u}`);
+    }
+  } else if (reviewsSummary.approvals === 0) {
+    blockers.push("No approvals yet.");
+  }
+
+  if (ageDays >= staleDays) blockers.push(`No PR activity in **${Math.floor(ageDays)} days**.`);
+
+  return { blockers, nextActors: [...nextActors] };
+}
+
+function computeReviewLatency(pr, now) {
+  const createdAt = new Date(pr.created_at);
+  const requestedReviewers = pr.requested_reviewers || [];
+  const requestedTeams = pr.requested_teams || [];
+
+  if (requestedReviewers.length === 0 && requestedTeams.length === 0) return null;
+
+  const hoursSinceCreated = Math.round((now - createdAt) / 3600000);
+  if (hoursSinceCreated < 1) return null;
+
+  if (hoursSinceCreated < 24) return `${hoursSinceCreated}h`;
+  const days = Math.round(hoursSinceCreated / 24);
+  return `${days}d`;
+}
+
+function summarizeTeamReviews(pr) {
+  const teams = (pr.requested_teams || []).map((t) => t.slug).filter(Boolean);
+  if (teams.length === 0) return [];
+
+  const teamLines = [];
+  for (const team of teams) {
+    teamLines.push(`\`${team}\` (team) — review pending`);
+  }
+  return teamLines;
+}
+
+// -------------------- Analyze a single PR --------------------
+
+async function analyzeState(octokit, { owner, repo, pr, reviews, checkRuns, staleDays, staleOverridesRaw, showReviewLatency, language }) {
+  const tr = getTranslator(language);
+
+  const updatedAt = new Date(pr.updated_at);
+  const now = new Date();
+  const ageDays = daysBetween(now, updatedAt);
+
+  const latestByUser = new Map();
+  for (const r of reviews) {
+    const login = r.user?.login;
+    if (!login || !r.submitted_at) continue;
+    const t = new Date(r.submitted_at);
+    const prev = latestByUser.get(login);
+    if (!prev || t > prev.t) latestByUser.set(login, { state: r.state, t });
+  }
+
+  let approvals = 0;
+  let requestedChanges = 0;
+  for (const v of latestByUser.values()) {
+    if (v.state === "APPROVED") approvals++;
+    if (v.state === "CHANGES_REQUESTED") requestedChanges++;
+  }
+
+  const requestedReviewers = [
+    ...(pr.requested_reviewers || []).map((u) => u.login).filter(Boolean),
+    ...(pr.requested_teams || []).map((t) => t.slug ? `${t.slug} (team)` : null).filter(Boolean)
+  ];
+
+  const reviewsSummary = { approvals, requestedChanges, requestedReviewers };
+  const checksSummary = summarizeChecks(checkRuns);
+
+  let effectiveStaleDays = staleDays;
+  if (staleOverridesRaw) {
+    try {
+      const overrides = JSON.parse(staleOverridesRaw);
+      const prLabels = (pr.labels || []).map((l) => l.name);
+      for (const label of prLabels) {
+        if (overrides[label] !== undefined) {
+          effectiveStaleDays = clampInt(overrides[label], staleDays, 1, 365);
+          break;
+        }
+      }
+    } catch {
+      core.warning("Could not parse stale_overrides as JSON; using default stale_days.");
+    }
+  }
+
+  const { blockers, nextActors } = classifyState({
+    pr,
+    checksSummary,
+    reviewsSummary,
+    staleDays: effectiveStaleDays,
+    ageDays
+  });
+
+  return {
+    tr,
+    pr,
+    ageDays,
+    checkRuns,
+    checksSummary,
+    approvals,
+    requestedChanges,
+    requestedReviewers,
+    blockers,
+    nextActors,
+    showReviewLatency,
+    now
+  };
+}
+
+function formatStateSection(analysis) {
+  const { tr, pr, ageDays, checkRuns, checksSummary, approvals, requestedChanges, requestedReviewers, blockers, nextActors, showReviewLatency, now } = analysis;
+  const lines = [];
+
+  lines.push(`#### ${tr.title}\n`);
+  lines.push(`**${tr.lastActivity}:** ${fmtAgeDays(ageDays)} (${pr.updated_at})`);
+  lines.push(`**${tr.draft}:** ${pr.draft ? tr.yes : tr.no}`);
+  lines.push(`**${tr.mergeable}:** ${pr.mergeable === null ? tr.unknown : (pr.mergeable ? tr.yes : tr.no)}`);
+  lines.push("");
+
+  lines.push(`**${tr.checks}:**`);
+  if (checkRuns.length === 0) {
+    lines.push(`- ${tr.noChecks}`);
+  } else {
+    if (checksSummary.failing.length) lines.push(`- ${tr.failing}: ${checksSummary.failing.map((n) => `\`${n}\``).join(", ")}`);
+    if (checksSummary.inProgress.length) lines.push(`- ${tr.running}: ${checksSummary.inProgress.map((n) => `\`${n}\``).join(", ")}`);
+    const c = checksSummary.counts;
+    lines.push(`- ${tr.totals}: ✅ ${c.success} | ❌ ${c.failure} | ⏳ ${c.in_progress + c.queued} | ⚪ ${c.skipped + c.neutral}`);
+  }
+  lines.push("");
+
+  lines.push(`**${tr.reviews}:**`);
+  lines.push(`- ${tr.approvals}: ${approvals}`);
+  lines.push(`- ${tr.changesRequested}: ${requestedChanges}`);
+  if (requestedReviewers.length) {
+    lines.push(`- ${tr.requested}: ${requestedReviewers.map((u) => u.startsWith("@") ? u : `@${u}`).join(", ")}`);
+  } else {
+    lines.push(`- ${tr.requested}: ${tr.none}`);
+  }
+
+  if (showReviewLatency) {
+    const latency = computeReviewLatency(pr, now);
+    if (latency) {
+      lines.push(`- ${tr.reviewLatency}: **${latency}**`);
+    }
+  }
+
+  const teamLines = summarizeTeamReviews(pr);
+  for (const tl of teamLines) {
+    lines.push(`- ${tl}`);
+  }
+
+  if (approvals === 0 && requestedReviewers.length === 0 && !pr.draft) {
+    lines.push(`- ${tr.noReviewers}`);
+  }
+  lines.push("");
+
+  lines.push(`**${tr.blocking}:**`);
+  if (blockers.length) {
+    for (const b of blockers) lines.push(`- ${b}`);
+  } else {
+    lines.push(`- ${tr.nothingBlocking}`);
+  }
+  lines.push("");
+
+  if (nextActors.length > 0) {
+    lines.push(`**${tr.nextAction}:** ${nextActors.join(", ")}`);
+    lines.push("");
+  }
+
+  lines.push(`_${tr.notes}_`);
+
+  return lines.join("\n");
+}
+
+// -------------------- Stale sweep --------------------
+
+async function staleSweep(octokit, { owner, repo, staleDays, maxChecks, staleOverridesRaw, dryRun, showReviewLatency, language, maxPRs, marker }) {
+  const { upsertComment } = __nccwpck_require__(3008);
+
+  const prs = await octokit.rest.pulls.list({
+    owner, repo, state: "open", sort: "updated", direction: "asc", per_page: maxPRs
+  });
+
+  const now = new Date();
+  let processed = 0;
+
+  for (const prSummary of prs.data) {
+    const updatedAt = new Date(prSummary.updated_at);
+    const ageDays = daysBetween(now, updatedAt);
+    if (ageDays < staleDays) continue;
+
+    try {
+      const prResp = await octokit.rest.pulls.get({ owner, repo, pull_number: prSummary.number });
+      const pr = prResp.data;
+
+      const reviewsResp = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: pr.number, per_page: 100 });
+      const checksResp = await octokit.rest.checks.listForRef({ owner, repo, ref: pr.head.sha, per_page: maxChecks });
+
+      const analysis = await analyzeState(octokit, {
+        owner, repo, pr, reviews: reviewsResp.data, checkRuns: checksResp.data.check_runs || [],
+        staleDays, staleOverridesRaw, showReviewLatency, language
+      });
+
+      const body = `### PR Advisor\n${marker}\n\n---\n` + formatStateSection(analysis);
+
+      if (dryRun) {
+        core.info(`Dry-run PR #${pr.number}:\n${body}`);
+      } else {
+        const res = await upsertComment(octokit, { owner, repo, issue_number: pr.number, body, marker });
+        core.info(`PR #${pr.number}: ${res.updated ? "updated" : "created"} comment: ${res.url}`);
+      }
+      processed++;
+    } catch (err) {
+      core.warning(`Failed to analyze PR #${prSummary.number}: ${err?.message || err}`);
+    }
+  }
+
+  core.info(`Stale sweep complete: processed ${processed} stale PR(s) out of ${prs.data.length} open.`);
+}
+
+module.exports = {
+  daysBetween,
+  analyzeState,
+  formatStateSection,
+  staleSweep
+};
+
+
+/***/ }),
+
+/***/ 3008:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const core = __nccwpck_require__(7484);
+
+function toBool(s, def = false) {
+  if (s == null) return def;
+  const v = String(s).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(v)) return true;
+  if (["0", "false", "no", "n", "off"].includes(v)) return false;
+  return def;
+}
+
+function clampInt(val, def, min, max) {
+  const n = parseInt(String(val ?? def), 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, n));
+}
+
+async function upsertComment(octokit, { owner, repo, issue_number, body, marker }) {
+  const comments = await octokit.rest.issues.listComments({
+    owner,
+    repo,
+    issue_number,
+    per_page: 100
+  });
+
+  const existing = comments.data.find((c) => (c.body || "").includes(marker));
+  if (existing) {
+    await octokit.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: existing.id,
+      body
+    });
+    return { updated: true, url: existing.html_url };
+  }
+
+  const created = await octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number,
+    body
+  });
+  return { updated: false, url: created.data.html_url };
+}
+
+async function deleteCommentByMarker(octokit, { owner, repo, issue_number, marker }) {
+  const comments = await octokit.rest.issues.listComments({
+    owner,
+    repo,
+    issue_number,
+    per_page: 100
+  });
+
+  const existing = comments.data.find((c) => (c.body || "").includes(marker));
+  if (existing) {
+    await octokit.rest.issues.deleteComment({
+      owner,
+      repo,
+      comment_id: existing.id
+    });
+    core.info(`Deleted old comment with marker ${marker}`);
+    return true;
+  }
+  return false;
+}
+
+async function listAllPRFiles(octokit, { owner, repo, pull_number, maxFiles }) {
+  const files = [];
+  let page = 1;
+
+  while (files.length < maxFiles) {
+    const resp = await octokit.rest.pulls.listFiles({
+      owner,
+      repo,
+      pull_number,
+      per_page: 100,
+      page
+    });
+
+    if (resp.data.length === 0) break;
+
+    for (const f of resp.data) {
+      files.push(f);
+      if (files.length >= maxFiles) break;
+    }
+
+    if (resp.data.length < 100) break;
+    page += 1;
+  }
+
+  return files;
+}
+
+function fmt(n) {
+  return new Intl.NumberFormat("en-US").format(n);
+}
+
+module.exports = {
+  toBool,
+  clampInt,
+  upsertComment,
+  deleteCommentByMarker,
+  listAllPRFiles,
+  fmt
+};
+
+
+/***/ }),
+
 /***/ 7182:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -62548,320 +63914,211 @@ exports.unescape = unescape;
 var __webpack_exports__ = {};
 const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
-const { minimatch } = __nccwpck_require__(6507);
 
-const MARKER = "<!-- analyze-pr-size:v0 -->";
+const { toBool, clampInt, upsertComment, deleteCommentByMarker, listAllPRFiles, fmt } = __nccwpck_require__(3008);
+const { DEFAULT_IGNORE, parseIgnorePatterns, filterIgnoredFiles, analyzeSize, formatSizeSection, applySizeLabel } = __nccwpck_require__(1827);
+const { daysBetween, analyzeState, formatStateSection, staleSweep } = __nccwpck_require__(1917);
+const { parseCommaSeparated, analyzeReviewers, formatReviewerSection } = __nccwpck_require__(6258);
 
-function toBool(s, def) {
-  if (s === undefined || s === null || s === "") return def;
-  return /^(true|yes|1|on)$/i.test(String(s).trim());
-}
+const MARKER = "<!-- pr-advisor:v0 -->";
 
-function clampInt(val, def, min, max) {
-  const n = parseInt(String(val ?? def), 10);
-  if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, n));
-}
+const OLD_MARKERS = [
+  "<!-- analyze-pr-size:v0 -->",
+  "<!-- pr-state-explainer:v0 -->",
+  "<!-- reviewer-suggester:v0 -->"
+];
 
-function bucketByThresholds(value, thresholds) {
-  // thresholds = [{name:"XS", max:...}, ...], last implied "XL"
-  for (const t of thresholds) {
-    if (value <= t.max) return t.name;
-  }
-  return "XL";
-}
-
-const SIZE_ORDER = ["XS", "S", "M", "L", "XL"];
-function maxBucket(a, b) {
-  return SIZE_ORDER[Math.max(SIZE_ORDER.indexOf(a), SIZE_ORDER.indexOf(b))];
-}
-
-async function upsertComment(octokit, { owner, repo, issue_number, body }) {
-  const comments = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number,
-    per_page: 100
-  });
-
-  const existing = comments.data.find((c) => (c.body || "").includes(MARKER));
-  if (existing) {
-    await octokit.rest.issues.updateComment({
-      owner,
-      repo,
-      comment_id: existing.id,
-      body
-    });
-    return { updated: true, url: existing.html_url };
-  }
-
-  const created = await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number,
-    body
-  });
-  return { updated: false, url: created.data.html_url };
-}
-
-async function listAllPRFiles(octokit, { owner, repo, pull_number, maxFiles }) {
-  const files = [];
-  let page = 1;
-
-  while (files.length < maxFiles) {
-    const resp = await octokit.rest.pulls.listFiles({
-      owner,
-      repo,
-      pull_number,
-      per_page: 100,
-      page
-    });
-
-    if (resp.data.length === 0) break;
-
-    for (const f of resp.data) {
-      files.push(f);
-      if (files.length >= maxFiles) break;
-    }
-
-    if (resp.data.length < 100) break;
-    page += 1;
-  }
-
-  return files;
-}
-
-const SIZE_LABEL_PREFIX = "size:";
-
-async function applySizeLabel(octokit, { owner, repo, prNumber, size }) {
-  const targetLabel = SIZE_LABEL_PREFIX + size;
-
-  const { data: currentLabels } = await octokit.rest.issues.listLabelsOnIssue({
-    owner,
-    repo,
-    issue_number: prNumber,
-    per_page: 100
-  });
-
-  const staleLabels = currentLabels.filter(
-    (l) => l.name.startsWith(SIZE_LABEL_PREFIX) && l.name !== targetLabel
-  );
-
-  for (const label of staleLabels) {
-    await octokit.rest.issues.removeLabel({
-      owner,
-      repo,
-      issue_number: prNumber,
-      name: label.name
-    });
-  }
-
-  const alreadyApplied = currentLabels.some((l) => l.name === targetLabel);
-  if (!alreadyApplied) {
-    await octokit.rest.issues.addLabels({
-      owner,
-      repo,
-      issue_number: prNumber,
-      labels: [targetLabel]
-    });
-  }
-}
-
-const DEFAULT_IGNORE = "dist/**,*.min.js,*.min.css,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*";
-
-function parseIgnorePatterns(raw) {
-  return raw
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean);
-}
-
-function filterIgnoredFiles(files, patterns) {
-  if (patterns.length === 0) return { counted: files, ignoredCount: 0 };
-
-  const counted = [];
-  let ignoredCount = 0;
-
-  for (const f of files) {
-    const ignored = patterns.some((p) => minimatch(f.filename, p, { matchBase: true }));
-    if (ignored) {
-      ignoredCount++;
-    } else {
-      counted.push(f);
+async function cleanupOldComments(octokit, { owner, repo, issue_number }) {
+  for (const marker of OLD_MARKERS) {
+    try {
+      await deleteCommentByMarker(octokit, { owner, repo, issue_number, marker });
+    } catch {
+      // best effort
     }
   }
-
-  return { counted, ignoredCount };
-}
-
-function topChangedDirectories(files, maxDepth, limit) {
-  const dirMap = new Map();
-
-  for (const f of files) {
-    const segments = f.filename.split("/");
-    const dir = segments.length <= maxDepth
-      ? segments.slice(0, -1).join("/") || "."
-      : segments.slice(0, maxDepth).join("/");
-    const prev = dirMap.get(dir) || { files: 0, lines: 0 };
-    prev.files += 1;
-    prev.lines += (f.additions || 0) + (f.deletions || 0);
-    dirMap.set(dir, prev);
-  }
-
-  return [...dirMap.entries()]
-    .sort((a, b) => b[1].lines - a[1].lines)
-    .slice(0, limit)
-    .map(([dir, stats]) => ({ dir, ...stats }));
-}
-
-function formatDirectoryTable(dirs) {
-  if (dirs.length === 0) return "";
-  let table = "\n**Top changed directories:**\n\n";
-  table += "| Directory | Files | Lines |\n";
-  table += "|-----------|------:|------:|\n";
-  for (const d of dirs) {
-    table += `| \`${d.dir}\` | ${d.files} | ${fmt(d.lines)} |\n`;
-  }
-  return table;
-}
-
-function buildSplitRecommendation(files, size) {
-  if (size !== "L" && size !== "XL") return "";
-
-  const topDirMap = new Map();
-  for (const f of files) {
-    const dir = f.filename.split("/").slice(0, 2).join("/") || ".";
-    const prev = topDirMap.get(dir) || 0;
-    topDirMap.set(dir, prev + (f.additions || 0) + (f.deletions || 0));
-  }
-
-  const sorted = [...topDirMap.entries()].sort((a, b) => b[1] - a[1]);
-  if (sorted.length < 2) return "";
-
-  const parts = [];
-  parts.push("\n**Split recommendation:** This PR is large — consider splitting it:");
-  const top3 = sorted.slice(0, 3);
-  for (const [dir, lines] of top3) {
-    parts.push(`- \`${dir}\` (${fmt(lines)} lines)`);
-  }
-  parts.push("");
-  return parts.join("\n");
-}
-
-function fmt(n) {
-  return new Intl.NumberFormat("en-US").format(n);
 }
 
 async function run() {
   try {
     const token = core.getInput("github_token", { required: true });
+    const dryRun = toBool(core.getInput("dry_run"), false);
+    const stepSummary = toBool(core.getInput("step_summary"), false);
 
+    // Section toggles
+    const enableSize = toBool(core.getInput("enable_size"), true);
+    const enableState = toBool(core.getInput("enable_state"), true);
+    const enableReviewer = toBool(core.getInput("enable_reviewer"), true);
+
+    // Size inputs
     const maxFiles = clampInt(core.getInput("max_files"), 500, 1, 5000);
     const addLabel = toBool(core.getInput("add_label"), false);
-    const stepSummary = toBool(core.getInput("step_summary"), false);
     const ignoreRaw = core.getInput("ignore_patterns") || DEFAULT_IGNORE;
     const ignorePatterns = parseIgnorePatterns(ignoreRaw);
-
     const xsLines = clampInt(core.getInput("xs_lines"), 50, 1, 1000000);
     const sLines = clampInt(core.getInput("s_lines"), 200, xsLines, 1000000);
     const mLines = clampInt(core.getInput("m_lines"), 500, sLines, 1000000);
     const lLines = clampInt(core.getInput("l_lines"), 1000, mLines, 1000000);
-
     const xsFiles = clampInt(core.getInput("xs_files"), 2, 1, 1000000);
     const sFiles = clampInt(core.getInput("s_files"), 5, xsFiles, 1000000);
     const mFiles = clampInt(core.getInput("m_files"), 15, sFiles, 1000000);
     const lFiles = clampInt(core.getInput("l_files"), 30, mFiles, 1000000);
 
+    // State inputs
+    const staleDays = clampInt(core.getInput("stale_days"), 3, 1, 365);
+    const commentOnlyWhenStale = toBool(core.getInput("comment_only_when_stale"), false);
+    const maxChecks = clampInt(core.getInput("max_checks"), 50, 10, 200);
+    const staleOverridesRaw = core.getInput("stale_overrides") || "";
+    const showReviewLatency = toBool(core.getInput("review_latency"), false);
+    const language = (core.getInput("language") || "en").trim().toLowerCase();
+    const sweepStale = toBool(core.getInput("sweep_stale"), false);
+    const maxPRs = clampInt(core.getInput("max_prs"), 50, 1, 200);
+
+    // Reviewer inputs
+    const maxReviewers = clampInt(core.getInput("max_reviewers"), 3, 1, 20);
+    const lookbackDays = clampInt(core.getInput("lookback_days"), 90, 1, 365);
+    const reviewerMaxFiles = clampInt(core.getInput("reviewer_max_files"), 50, 1, 200);
+    const useCodeowners = toBool(core.getInput("use_codeowners"), true);
+    const useLatency = toBool(core.getInput("use_latency"), true);
+    const latencyPRs = clampInt(core.getInput("latency_prs"), 20, 5, 50);
+    const penalizeLoad = toBool(core.getInput("penalize_load"), true);
+    const excludeReviewersInput = parseCommaSeparated(core.getInput("exclude_reviewers"));
+    const crossRepoList = parseCommaSeparated(core.getInput("cross_repo_list"));
+    const requiredReviewers = parseCommaSeparated(core.getInput("required_reviewers"));
+    const preferTimezone = (core.getInput("prefer_timezone") || "").trim();
+    const showBreakdown = toBool(core.getInput("show_breakdown"), false);
+    const detectFlaky = toBool(core.getInput("detect_flaky"), false);
+
     const ctx = github.context;
+    const octokit = github.getOctokit(token);
+    const { owner, repo } = ctx.repo;
+
+    // Stale sweep mode: only state section runs, iterates all open PRs
+    if (sweepStale || ctx.eventName === "schedule") {
+      await staleSweep(octokit, {
+        owner, repo, staleDays, maxChecks, staleOverridesRaw,
+        dryRun, showReviewLatency, language, maxPRs, marker: MARKER
+      });
+      return;
+    }
+
     if (ctx.eventName !== "pull_request" || !ctx.payload.pull_request) {
       core.info("Not a pull_request event; skipping.");
       return;
     }
 
-    const octokit = github.getOctokit(token);
-    const { owner, repo } = ctx.repo;
     const prNumber = ctx.payload.pull_request.number;
+    const prAuthor = ctx.payload.pull_request.user?.login;
+    const prHeadSha = ctx.payload.pull_request.head?.sha;
 
-    const allFiles = await listAllPRFiles(octokit, {
-      owner,
-      repo,
-      pull_number: prNumber,
-      maxFiles
-    });
-
-    const { counted: files, ignoredCount } = filterIgnoredFiles(allFiles, ignorePatterns);
-
-    let additions = 0;
-    let deletions = 0;
-
-    for (const f of files) {
-      additions += f.additions || 0;
-      deletions += f.deletions || 0;
+    // Check stale-only mode
+    if (commentOnlyWhenStale) {
+      const updatedAt = new Date(ctx.payload.pull_request.updated_at);
+      const ageDays = daysBetween(new Date(), updatedAt);
+      if (ageDays < staleDays) {
+        core.info(`PR not stale (${ageDays.toFixed(2)} days < ${staleDays}); skipping comment.`);
+        return;
+      }
     }
 
-    const fileCount = files.length;
-    const totalChanged = additions + deletions;
+    // ---- Shared API calls (fetch once, pass to modules) ----
+    const prResp = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    const pr = prResp.data;
 
-    const lineBucket = bucketByThresholds(totalChanged, [
-      { name: "XS", max: xsLines },
-      { name: "S", max: sLines },
-      { name: "M", max: mLines },
-      { name: "L", max: lLines }
-    ]);
-
-    const fileBucket = bucketByThresholds(fileCount, [
-      { name: "XS", max: xsFiles },
-      { name: "S", max: sFiles },
-      { name: "M", max: mFiles },
-      { name: "L", max: lFiles }
-    ]);
-
-    const size = maxBucket(lineBucket, fileBucket);
-
-    const topDirs = topChangedDirectories(files, 2, 5);
-    const dirSection = formatDirectoryTable(topDirs);
-    const splitSection = buildSplitRecommendation(files, size);
-
-    const body =
-      `### PR Size Summary\n${MARKER}\n\n` +
-      `Files changed: **${fmt(fileCount)}**\n\n` +
-      `Lines added: **+${fmt(additions)}**  \n` +
-      `Lines removed: **-${fmt(deletions)}**  \n` +
-      `Total changed: **${fmt(totalChanged)}**\n\n` +
-      `Size: **${size}**\n` +
-      (ignoredCount > 0 ? `_(${ignoredCount} generated/lock file${ignoredCount === 1 ? "" : "s"} excluded)_\n` : "") +
-      dirSection +
-      splitSection + `\n` +
-      `_Notes: size is based on the larger of file-count bucket and line-change bucket._\n`;
-
-    const res = await upsertComment(octokit, {
-      owner,
-      repo,
-      issue_number: prNumber,
-      body
+    const allFiles = await listAllPRFiles(octokit, {
+      owner, repo, pull_number: prNumber, maxFiles
     });
 
-    core.info(res.updated ? "Updated PR size comment." : "Created PR size comment.");
+    const reviewsResp = await octokit.rest.pulls.listReviews({
+      owner, repo, pull_number: prNumber, per_page: 100
+    });
+
+    const checksResp = await octokit.rest.checks.listForRef({
+      owner, repo, ref: pr.head.sha, per_page: maxChecks
+    });
+
+    // ---- Build sections ----
+    const sections = [];
+
+    if (enableSize) {
+      const { counted: files, ignoredCount } = filterIgnoredFiles(allFiles, ignorePatterns);
+      const thresholds = { xsLines, sLines, mLines, lLines, xsFiles, sFiles, mFiles, lFiles };
+      const sizeResult = analyzeSize({ files, thresholds });
+
+      sections.push(formatSizeSection({
+        ...sizeResult,
+        ignoredCount,
+        files
+      }));
+
+      core.setOutput("size", sizeResult.size);
+      core.setOutput("total_lines", sizeResult.totalChanged);
+      core.setOutput("file_count", sizeResult.fileCount);
+
+      const prCreatedAt = ctx.payload.pull_request.created_at;
+      if (prCreatedAt) {
+        const ageHours = Math.round((Date.now() - new Date(prCreatedAt).getTime()) / 3600000);
+        core.setOutput("pr_age_hours", ageHours);
+      }
+
+      if (addLabel) {
+        await applySizeLabel(octokit, { owner, repo, prNumber, size: sizeResult.size });
+        core.info(`Applied label: size:${sizeResult.size}`);
+      }
+    }
+
+    if (enableState) {
+      const analysis = await analyzeState(octokit, {
+        owner, repo, pr,
+        reviews: reviewsResp.data,
+        checkRuns: checksResp.data.check_runs || [],
+        staleDays, staleOverridesRaw, showReviewLatency, language
+      });
+
+      sections.push(formatStateSection(analysis));
+    }
+
+    if (enableReviewer) {
+      const reviewerResult = await analyzeReviewers(octokit, {
+        owner, repo, prNumber, prAuthor, prHeadSha,
+        files: allFiles, reviews: reviewsResp.data,
+        config: {
+          maxReviewers, lookbackDays, maxFiles: reviewerMaxFiles,
+          useCodeowners, useLatency, latencyPRs,
+          penalizeLoad, excludeReviewersInput, crossRepoList, requiredReviewers,
+          preferTimezone, showBreakdown, detectFlaky
+        }
+      });
+
+      sections.push(formatReviewerSection(reviewerResult));
+
+      if (dryRun) {
+        core.setOutput("suggestions_json", JSON.stringify(reviewerResult.suggestions));
+      }
+    }
+
+    if (sections.length === 0) {
+      core.info("All sections disabled; nothing to do.");
+      return;
+    }
+
+    const body = `### PR Advisor\n${MARKER}\n\n---\n` + sections.join("\n---\n");
+
+    if (dryRun) {
+      core.info("Dry-run mode: comment body below (not posted):");
+      core.info(body);
+      return;
+    }
+
+    // Clean up old individual action comments on first run
+    await cleanupOldComments(octokit, { owner, repo, issue_number: prNumber });
+
+    const res = await upsertComment(octokit, { owner, repo, issue_number: prNumber, body, marker: MARKER });
+    core.info(res.updated ? "Updated PR Advisor comment." : "Created PR Advisor comment.");
     core.info(`Comment: ${res.url}`);
 
     if (stepSummary) {
       await core.summary.addRaw(body).write();
       core.info("Wrote step summary.");
-    }
-
-    if (addLabel) {
-      await applySizeLabel(octokit, { owner, repo, prNumber, size });
-      core.info(`Applied label: ${SIZE_LABEL_PREFIX}${size}`);
-    }
-
-    core.setOutput("size", size);
-    core.setOutput("total_lines", totalChanged);
-    core.setOutput("file_count", fileCount);
-
-    const prCreatedAt = ctx.payload.pull_request.created_at;
-    if (prCreatedAt) {
-      const ageHours = Math.round((Date.now() - new Date(prCreatedAt).getTime()) / 3600000);
-      core.setOutput("pr_age_hours", ageHours);
     }
   } catch (err) {
     core.setFailed(err?.message || String(err));
@@ -62869,6 +64126,7 @@ async function run() {
 }
 
 run();
+
 module.exports = __webpack_exports__;
 /******/ })()
 ;
