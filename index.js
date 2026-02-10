@@ -118,9 +118,15 @@ async function run() {
       owner, repo, pull_number: prNumber, per_page: 100
     });
 
-    const checksResp = await octokit.rest.checks.listForRef({
-      owner, repo, ref: pr.head.sha, per_page: maxChecks
-    });
+    let checkRuns = [];
+    try {
+      const checksResp = await octokit.rest.checks.listForRef({
+        owner, repo, ref: pr.head.sha, per_page: maxChecks
+      });
+      checkRuns = checksResp.data.check_runs || [];
+    } catch {
+      core.warning("Could not fetch check runs (needs checks:read permission); skipping checks info.");
+    }
 
     // ---- Build sections ----
     const sections = [];
@@ -156,7 +162,7 @@ async function run() {
       const analysis = await analyzeState(octokit, {
         owner, repo, pr,
         reviews: reviewsResp.data,
-        checkRuns: checksResp.data.check_runs || [],
+        checkRuns,
         staleDays, staleOverridesRaw, showReviewLatency, language
       });
 

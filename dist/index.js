@@ -38587,10 +38587,16 @@ async function staleSweep(octokit, { owner, repo, staleDays, maxChecks, staleOve
       const pr = prResp.data;
 
       const reviewsResp = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: pr.number, per_page: 100 });
-      const checksResp = await octokit.rest.checks.listForRef({ owner, repo, ref: pr.head.sha, per_page: maxChecks });
+      let checkRuns = [];
+      try {
+        const checksResp = await octokit.rest.checks.listForRef({ owner, repo, ref: pr.head.sha, per_page: maxChecks });
+        checkRuns = checksResp.data.check_runs || [];
+      } catch {
+        warning(`Could not fetch check runs for PR #${pr.number} (needs checks:read permission); skipping checks info.`);
+      }
 
       const analysis = await analyzeState(octokit, {
-        owner, repo, pr, reviews: reviewsResp.data, checkRuns: checksResp.data.check_runs || [],
+        owner, repo, pr, reviews: reviewsResp.data, checkRuns,
         staleDays, staleOverridesRaw, showReviewLatency, language
       });
 
@@ -39391,9 +39397,15 @@ async function run() {
       owner, repo, pull_number: prNumber, per_page: 100
     });
 
-    const checksResp = await octokit.rest.checks.listForRef({
-      owner, repo, ref: pr.head.sha, per_page: maxChecks
-    });
+    let checkRuns = [];
+    try {
+      const checksResp = await octokit.rest.checks.listForRef({
+        owner, repo, ref: pr.head.sha, per_page: maxChecks
+      });
+      checkRuns = checksResp.data.check_runs || [];
+    } catch {
+      warning("Could not fetch check runs (needs checks:read permission); skipping checks info.");
+    }
 
     // ---- Build sections ----
     const sections = [];
@@ -39429,7 +39441,7 @@ async function run() {
       const analysis = await analyzeState(octokit, {
         owner, repo, pr,
         reviews: reviewsResp.data,
-        checkRuns: checksResp.data.check_runs || [],
+        checkRuns,
         staleDays, staleOverridesRaw, showReviewLatency, language
       });
 
