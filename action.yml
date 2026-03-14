@@ -164,5 +164,5 @@ outputs:
   suggestions_json:
     description: "JSON array of reviewer suggestions (when dry_run is enabled)"
 runs:
-  using: "node20"
+  using: "node22"
   main: "dist/index.js"
